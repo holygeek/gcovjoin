@@ -1,0 +1,158 @@
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Carp;
+use Getopt::Std;
+use File::Slurp;
+use File::Basename;
+
+my $me = basename(__FILE__);
+
+sub usage {
+	print <<"EOF";
+NAME
+	$me - joins (naively) multiple gcov files
+
+SYNOPSYS
+	$me -o <output> <files>
+
+DESCRIPTION
+	Join multiple gcov report of the same executable into a single file,
+	accumulating the line hit count.
+
+	Report error if two or more of the input files are not from the same
+	source code.
+
+OPTIONS
+	-h
+		Display this help message
+
+	-o <output>
+		Where to save the output. Use '-' to dump to stdout.
+EOF
+}
+
+
+my %opts;
+if (! getopts('ho:', \%opts)) {
+	usage();
+	exit 1;
+}
+
+exit 0 if defined $opts{h} && usage();
+
+die "No files to process" if scalar @ARGV <= 1;
+
+die "No output specified." if ! defined $opts{o};
+
+my $output = $opts{o};
+my $FH;
+if ($output eq '-') {
+	no strict 'subs';
+	$FH = STDOUT;
+} else {
+	open($FH, '>', $output) or die("Could not open $output: $!");
+}
+
+
+my $c = 1;
+my $filename = shift @ARGV;
+die "No such file $filename" if ! -f $filename;
+my ($count_file, $content_file) = gcov_split($filename, "tmp/$c");
+my @cumulative = get_gcov_array($count_file);
+my $width = length($cumulative[0]);
+
+foreach $filename (@ARGV) {
+	$c += 1;
+	die "$me: No such file $filename" if ! -f $filename;
+
+	my ($count_file, $new_content_file) = gcov_split($filename, "tmp/$c");
+	my $diff = qx/diff $content_file $new_content_file/;
+	print STDERR "$me: $content_file and $new_content_file are different?"
+		if (length $diff);
+
+	my @new = get_gcov_array($count_file);
+	if (length($new[0]) > $width) {
+		print STDERR "? Found different width in $filename\n";
+		$width = length($new[0]);
+	}
+	accumulate_gcov_line(\@cumulative, \@new);
+}
+
+$c = 0;
+my @content = read_file($content_file);
+my $fmt_num = "%${width}d:%s";
+my $fmt_str   = "%${width}s:%s";
+foreach my $v (@cumulative) {
+	my $line;
+	if (is_digit($v)) {
+		$line = sprintf($fmt_num, $v, $content[$c]);
+	} else {
+		$line = sprintf($fmt_str, $v, $content[$c]);
+	}
+	print $FH $line;
+	$c += 1;
+}
+close $FH;
+
+#==============================================================================#
+sub get_gcov_array {
+	my ($count_file) = @_;
+
+	return map { my $t = $_; chomp $t; $t =~ /^\s*[0-9]+$/ ? int($t) : $t }
+		read_file($count_file);
+}
+
+sub is_digit {
+	my ($txt) = @_;
+	return $txt =~ /^[[:digit:]]+$/;
+}
+
+sub accumulate_gcov_line {
+	my ($a, $b) = @_;
+
+	my $i = 0;
+	foreach my $v (@$a) {
+		my $c = $b->[$i];
+
+		if (is_digit($c)) {
+			if (is_digit($v)) {
+				$v += $c;
+			} else {
+				$v = $c;
+			}
+		} elsif (! is_digit($v) && $v ne $c) {
+			# Sanity check
+			print STDERR "v and c different?: v='$v', c = '$c'?\n";
+		}
+		$i += 1;
+	}
+}
+
+sub gcov_split {
+	my ($filename, $dstdir) = @_;
+
+	if (! -f $filename) {
+		carp "$filename does not exists";
+		return (undef, undef);
+	}
+
+	qx/mkdir -p $dstdir/;
+	if (! -d $dstdir) {
+		carp "Could not create $dstdir";
+		return (undef, undef);
+	}
+	if (! -w $dstdir) {
+		carp "Could not write to $dstdir";
+		return (undef, undef);
+	}
+
+	my $count_file = "$dstdir/count.txt";
+	my $right_file = "$dstdir/right.txt";
+
+	qx"cut -d: -f 1 $filename > $count_file";
+	qx"cut -d: -f 2,3- $filename > $right_file";
+
+	return ($count_file, $right_file);
+}
+
